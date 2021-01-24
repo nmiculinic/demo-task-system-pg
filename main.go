@@ -101,7 +101,6 @@ func genFn(ctx context.Context, depth int) (*uuid.UUID, error) {
 }
 
 func worker(ctx context.Context) error {
-	//for taskId := range readyTasks {
 	for {
 		conn, err := pool.Acquire(ctx)
 		if err != nil {
@@ -151,8 +150,8 @@ WHERE id = $1`, id); err != nil {
 	}
 	if _, err := tx.Exec(ctx, `
 UPDATE tasks
-SET deps = array_remove(deps, $1)
-WHERE $1 = ANY (deps)
+SET deps = array_remove(deps, $1::uuid)
+WHERE ARRAY[$1::uuid] <@ deps
 				`, id); err != nil {
 		return err
 	}
@@ -193,10 +192,10 @@ func throughput() {
 		t := time.Now()
 		time.Sleep(5 * time.Second)
 		total := atomic.LoadInt64(&totalProcessed)
-		throughPut.Set(
-			float64(total) /
-			(float64(time.Since(t)) / float64(time.Second)),
-		)
+		val := float64(total) /
+				(float64(time.Since(t)) / float64(time.Second))
+		throughPut.Set(val)
+		zap.L().Info("throughput ticker", zap.Float64("it/s", val))
 		atomic.StoreInt64(&totalProcessed, 0)
 	}
 }
