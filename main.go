@@ -132,9 +132,30 @@ WHERE finished = FALSE AND deps = '{}'
 }
 
 func worker(ctx context.Context) error {
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Release()
+	_, err = conn.Conn().Prepare(ctx, "propagate_deps", `
+UPDATE tasks
+SET deps = array_remove(deps, $1::uuid)
+WHERE ARRAY[$1::uuid] <@ deps
+`)
+	if err != nil {
+		return err
+	}
+	_, err = conn.Conn().Prepare(ctx, "set_finished", `
+UPDATE tasks
+SET finished = TRUE
+WHERE id = $1`,
+	)
+	if err != nil {
+		return err
+	}
 	for taskId := range readyTasks {
 		<-rateLimit
-		if err := processEntry(ctx, taskId); err != nil {
+		if err := processEntry(ctx, taskId, conn.Conn()); err != nil {
 			return err
 		}
 	}
@@ -161,28 +182,16 @@ func watchReadyTasks(ctx context.Context) error {
 
 }
 
-func processEntry(ctx context.Context, id uuid.UUID) error {
+func processEntry(ctx context.Context, id uuid.UUID, conn *pgx.Conn) error {
 	t := time.Now()
-	conn, err := pool.Acquire(ctx)
-	if err != nil {
-		return err
-	}
-	defer conn.Release()
 	tx, err := conn.Begin(ctx)
 	if err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, `
-UPDATE tasks
-SET finished = TRUE
-WHERE id = $1`, id); err != nil {
+	if _, err := tx.Exec(ctx, "propagate_deps", id); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, `
-UPDATE tasks
-SET deps = array_remove(deps, $1::uuid)
-WHERE ARRAY[$1::uuid] <@ deps
-				`, id); err != nil {
+	if _, err := tx.Exec(ctx, "set_finished", id); err != nil {
 		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -220,7 +229,7 @@ func setup() error {
 func throughput() {
 	for {
 		t := time.Now()
-		time.Sleep(5 * time.Second)
+		time.Sleep(2 * time.Second)
 		total := atomic.LoadInt64(&totalProcessed)
 		val := float64(total) /
 				(float64(time.Since(t)) / float64(time.Second))
@@ -238,6 +247,7 @@ func main() {
 	if err := setup(); err != nil {
 		panic(err)
 	}
+	defer pool.Close()
 
 	logger := zap.L()
 	g, ctx := errgroup.WithContext(ctx)
@@ -253,10 +263,12 @@ func main() {
 		logger.Info("Initial load")
 		return initialLoad(ctx)
 	})
-	g.Go(func() error {
-		logger.Info("Starting worker")
-		return worker(ctx)
-	})
+	for i := 0; i < 5; i++ {
+		g.Go(func() error {
+			logger.Info("Starting worker")
+			return worker(ctx)
+		})
+	}
 	g.Go(func() error {
 		throughput()
 		return nil
