@@ -1,0 +1,28 @@
+# Use postgres/example user/password credentials
+version: '3.1'
+
+services:
+  db:
+    image: postgres:13
+    restart: always
+#    command:
+#      - "-c"
+#      - "max_connections=1000"
+#      - "-c"
+#      - "shared_buffers=32MB"
+    environment:
+    - POSTGRES_PASSWORD=postgres
+#      - POSTGRES_DB=postgres
+#      - POSTGRES_USER=postgres
+    volumes:
+      - postgresql:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - local
+
+volumes:
+  postgresql:
+
+networks:
+  local:
