@@ -23,6 +23,10 @@ var (
 	readyTasks = make(chan uuid.UUID, 1000)
 	rateLimit = make(chan struct{}, 1000)
 	pool *pgxpool.Pool
+	notifCount = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "myapp_notif_recv_total",
+		Help: "Total number of pg notification recieved",
+	})
 	addedProcessed = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "myapp_added_ops_total",
 		Help: "The total number of added events",
@@ -100,35 +104,61 @@ func genFn(ctx context.Context, depth int) (*uuid.UUID, error) {
 	return &id, nil
 }
 
-func worker(ctx context.Context) error {
-	for {
-		conn, err := pool.Acquire(ctx)
-		if err != nil {
-			return err
-		}
-		rows, err := conn.Query(ctx, `
+func initialLoad(ctx context.Context) error {
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	rows, err := conn.Query(ctx, `
 SELECT id, data
 FROM tasks
 WHERE finished = FALSE AND deps = '{}'
 `)
-		if err != nil {
+	if err != nil {
+		conn.Release()
+		return err
+	}
+	for rows.Next() {
+		taskId := uuid.UUID{}
+		data := ""
+		if err := rows.Scan(&taskId, &data); err != nil {
 			conn.Release()
 			return err
 		}
-		for rows.Next() {
-			taskId := uuid.UUID{}
-			data := ""
-			if err := rows.Scan(&taskId, &data); err != nil {
-				conn.Release()
-				return err
-			}
-			<-rateLimit
-			if err := processEntry(ctx, taskId); err != nil {
-				conn.Release()
-				return err
-			}
+		readyTasks <- taskId
+	}
+	zap.L().Info("initial load added to the queue")
+	return nil
+}
+
+func worker(ctx context.Context) error {
+	for taskId := range readyTasks {
+		<-rateLimit
+		if err := processEntry(ctx, taskId); err != nil {
+			return err
 		}
 	}
+	return nil
+}
+
+func watchReadyTasks(ctx context.Context) error {
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Release()
+	if _, err := conn.Conn().Exec(ctx, `LISTEN ready_task`); err != nil {
+		return err
+	}
+	for {
+		notif, err := conn.Conn().WaitForNotification(ctx)
+		if err != nil {
+			return err
+		}
+		notifCount.Inc()
+		readyTasks <- uuid.MustParse(notif.Payload)
+	}
+
 }
 
 func processEntry(ctx context.Context, id uuid.UUID) error {
@@ -212,8 +242,16 @@ func main() {
 	logger := zap.L()
 	g, ctx := errgroup.WithContext(ctx)
 	g.Go(func() error {
+		logger.Info("starting watch for notifications")
+		return watchReadyTasks(ctx)
+	})
+	g.Go(func() error {
 		logger.Info("Starting producer")
 		return producer(ctx)
+	})
+	g.Go(func() error {
+		logger.Info("Initial load")
+		return initialLoad(ctx)
 	})
 	g.Go(func() error {
 		logger.Info("Starting worker")
